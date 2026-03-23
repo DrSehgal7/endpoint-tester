@@ -1,0 +1,7 @@
+.env
+node_modules
+bun.lock
+reports
+.start-timestamp
+agent-sessions
+
