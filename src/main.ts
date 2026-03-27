@@ -38,6 +38,57 @@ type ExecutionResult = {
   logId?: string;
 };
 
+type ComposioExecutePayload = {
+  actionName: string;
+  connectedAccountId: string;
+  input: Record<string, unknown>;
+};
+
+type ComposioWithExecute = Composio & {
+  execute: (payload: ComposioExecutePayload) => Promise<ExecutionResult>;
+};
+
+type ToolDefinition = {
+  function: {
+    name: string;
+    description?: string;
+    parameters?: {
+      type?: string;
+      properties?: Record<string, { type?: string; description?: string; enum?: unknown[] }>;
+      required?: string[];
+    };
+  };
+};
+
+type EndpointIntent = {
+  resource: "message" | "thread" | "label" | "profile" | "draft" | "event" | "calendar" | "reminder" | "unknown";
+  operation: "list" | "get" | "create" | "send" | "trash" | "delete" | "archive" | "unknown";
+  hasPathId: boolean;
+  needsBody: boolean;
+  destructive: boolean;
+};
+
+type ActionResolution = {
+  actionName: string | null;
+  confidence: number;
+  exactMatch: boolean;
+  reason: string;
+  candidates: Array<{ actionName: string; score: number; reason: string }>;
+};
+
+type PlanningStep =
+  | { kind: "resolve_self_email"; reason: string }
+  | { kind: "resolve_message_id"; owned: boolean; reason: string }
+  | { kind: "resolve_event_id"; owned: boolean; reason: string };
+
+type ExecutionPlan = {
+  resolvedActionName: string | null;
+  actionResolution: string;
+  actionCandidates: Array<{ actionName: string; score: number; reason: string }>;
+  steps: PlanningStep[];
+  arguments: Record<string, unknown>;
+};
+
 type EndpointReport = {
   toolkit: ToolkitSlug;
   toolSlug: string;
@@ -50,9 +101,10 @@ type EndpointReport = {
   errorMessage: string | null;
   requiredScopes: string[];
   availableScopes: string[];
-  dependencyStrategy: string | null;
-  dependencySource: string | null;
   classificationReason: string;
+  actionResolution: string;
+  actionCandidates: Array<{ actionName: string; score: number; reason: string }>;
+  planSteps: string[];
   logId: string | null;
 };
 
@@ -70,36 +122,6 @@ const RUN_ID = `run-${Date.now()}`;
 const EVENT_TITLE = `[Endpoint Tester] ${RUN_ID} calendar fixture`;
 const EMAIL_SUBJECT = `[Endpoint Tester] ${RUN_ID} mailbox fixture`;
 const TIMEZONE = "UTC";
-const ACTION_MAP: Record<string, string | null> = {
-  GMAIL_GET_MESSAGE: "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
-  GMAIL_SEND_MESSAGE: "GMAIL_SEND_EMAIL",
-  GMAIL_CREATE_DRAFT: "GMAIL_CREATE_EMAIL_DRAFT",
-  GMAIL_TRASH_MESSAGE: "GMAIL_MOVE_TO_TRASH",
-  GMAIL_LIST_FOLDERS: null,
-  GMAIL_ARCHIVE_MESSAGE: null,
-  GOOGLECALENDAR_LIST_EVENTS: "GOOGLECALENDAR_FIND_EVENT",
-  GOOGLECALENDAR_GET_EVENT: "GOOGLECALENDAR_EVENTS_GET",
-  GOOGLECALENDAR_LIST_REMINDERS: null,
-};
-
-const ENDPOINT_ORDER = [
-  "GMAIL_GET_PROFILE",
-  "GMAIL_LIST_MESSAGES",
-  "GMAIL_GET_MESSAGE",
-  "GMAIL_SEND_MESSAGE",
-  "GMAIL_LIST_LABELS",
-  "GMAIL_CREATE_DRAFT",
-  "GMAIL_LIST_THREADS",
-  "GMAIL_TRASH_MESSAGE",
-  "GMAIL_LIST_FOLDERS",
-  "GMAIL_ARCHIVE_MESSAGE",
-  "GOOGLECALENDAR_LIST_CALENDARS",
-  "GOOGLECALENDAR_CREATE_EVENT",
-  "GOOGLECALENDAR_LIST_EVENTS",
-  "GOOGLECALENDAR_GET_EVENT",
-  "GOOGLECALENDAR_DELETE_EVENT",
-  "GOOGLECALENDAR_LIST_REMINDERS",
-] as const;
 
 const endpoints: EndpointSpec[] = [
   ...endpointCatalog.gmail.endpoints.map((endpoint) => ({ ...endpoint, toolkit: "gmail" as const })),
@@ -107,12 +129,13 @@ const endpoints: EndpointSpec[] = [
     ...endpoint,
     toolkit: "googlecalendar" as const,
   })),
-].sort((a, b) => ENDPOINT_ORDER.indexOf(a.tool_slug as never) - ENDPOINT_ORDER.indexOf(b.tool_slug as never));
+];
 
 class EndpointTesterAgent {
-  private composio: Composio;
-  private actionCache = new Map<string, boolean>();
+  private composio: ComposioWithExecute;
   private accounts = new Map<ToolkitSlug, ConnectedAccount>();
+  private toolCatalog = new Map<ToolkitSlug, ToolDefinition[]>();
+  private actionLookup = new Map<string, ToolDefinition | null>();
   private selfEmail: string | null = null;
   private listedMessageId: string | null = null;
   private ownedMessageId: string | null = null;
@@ -121,23 +144,31 @@ class EndpointTesterAgent {
   private eventDeleted = false;
 
   constructor(apiKey: string) {
-    this.composio = new Composio({ apiKey });
+    const composio = new Composio({ apiKey }) as ComposioWithExecute;
+
+    // Normalize the installed SDK to the README's `composio.execute(...)` contract.
+    if (typeof composio.execute !== "function") {
+      composio.execute = async ({ actionName, connectedAccountId, input }) => {
+        return (await composio.tools.execute(actionName, {
+          userId: USER_ID,
+          connectedAccountId,
+          dangerouslySkipVersionCheck: true,
+          arguments: input,
+        })) as ExecutionResult;
+      };
+    }
+
+    this.composio = composio;
   }
 
   async run(outputPath = DEFAULT_OUTPUT): Promise<RunReport> {
-    await this.loadAccounts();
+    await this.loadConnectedAccounts();
+    await this.loadToolCatalogs();
 
     const results: EndpointReport[] = [];
     for (const endpoint of endpoints) {
       results.push(await this.testEndpoint(endpoint));
     }
-
-    const summary: RunReport["summary"] = {
-      valid: results.filter((item) => item.status === "valid").length,
-      invalid_endpoint: results.filter((item) => item.status === "invalid_endpoint").length,
-      insufficient_scopes: results.filter((item) => item.status === "insufficient_scopes").length,
-      error: results.filter((item) => item.status === "error").length,
-    };
 
     const report: RunReport = {
       generatedAt: new Date().toISOString(),
@@ -152,7 +183,12 @@ class EndpointTesterAgent {
           availableScopes: this.getAvailableScopes("googlecalendar"),
         },
       },
-      summary,
+      summary: {
+        valid: results.filter((item) => item.status === "valid").length,
+        invalid_endpoint: results.filter((item) => item.status === "invalid_endpoint").length,
+        insufficient_scopes: results.filter((item) => item.status === "insufficient_scopes").length,
+        error: results.filter((item) => item.status === "error").length,
+      },
       results,
     };
 
@@ -161,7 +197,7 @@ class EndpointTesterAgent {
     return report;
   }
 
-  private async loadAccounts() {
+  private async loadConnectedAccounts() {
     const response = await this.composio.connectedAccounts.list({ userIds: [USER_ID] });
     const items = (response.items ?? []) as ConnectedAccount[];
 
@@ -175,236 +211,374 @@ class EndpointTesterAgent {
     }
   }
 
+  private async loadToolCatalogs() {
+    for (const toolkit of ["gmail", "googlecalendar"] as const) {
+      try {
+        const tools = (await this.composio.tools.get(USER_ID, {
+          toolkits: [toolkit],
+        })) as ToolDefinition[];
+        this.toolCatalog.set(toolkit, tools);
+      } catch {
+        this.toolCatalog.set(toolkit, []);
+      }
+    }
+  }
+
   private async testEndpoint(endpoint: EndpointSpec): Promise<EndpointReport> {
     const availableScopes = this.getAvailableScopes(endpoint.toolkit);
     const account = this.accounts.get(endpoint.toolkit);
-    const resolvedActionName = await this.resolveActionName(endpoint.tool_slug);
 
     if (!account) {
-      return this.buildReport(endpoint, resolvedActionName, "error", null, null, {
+      return this.buildReport(endpoint, null, "error", null, null, {
         responseSummary: "No active connected account available for toolkit",
         errorMessage: "connected_account_unavailable",
-        dependencyStrategy: null,
-        dependencySource: null,
         classificationReason: "No active Composio connected account exists for this toolkit",
+        actionResolution: "No connected account available, so the endpoint could not be tested",
+        actionCandidates: [],
+        planSteps: [],
         availableScopes,
       });
     }
 
-    if (!resolvedActionName) {
+    const resolution = await this.resolveAction(endpoint);
+    if (!resolution.actionName) {
       return this.buildReport(endpoint, null, "invalid_endpoint", null, null, {
         responseSummary: "No matching Composio action exists for this endpoint",
         errorMessage: "tool_not_found",
-        dependencyStrategy: null,
-        dependencySource: null,
-        classificationReason: "The endpoint has no executable Composio action mapping",
+        classificationReason: "The live Composio toolkit did not expose an action that matched the endpoint spec strongly enough",
+        actionResolution: resolution.reason,
+        actionCandidates: resolution.candidates,
+        planSteps: [],
         availableScopes,
       });
     }
 
+    const plan = await this.planEndpoint(endpoint, resolution);
+
     try {
-      const prepared = await this.buildArguments(endpoint, resolvedActionName);
-      const result = await this.executeAction(endpoint.toolkit, resolvedActionName, prepared.arguments);
+      await this.executePlanningSteps(plan.steps);
+      if (!plan.resolvedActionName) {
+        throw new Error("No resolved action name available for endpoint execution");
+      }
+      const composedArguments = this.composeArguments(endpoint, plan.resolvedActionName, plan.arguments);
+      const result = await this.composioExecute(endpoint.toolkit, plan.resolvedActionName, composedArguments);
       const status = this.classifyResult(result.error, result.successful);
-      const responseSummary = summarizePayload(result.successful ? result.data : result.error);
-      const errorMessage = result.successful ? null : summarizePayload(result.error);
 
       this.captureRuntimeState(endpoint.tool_slug, result.data);
 
-      return this.buildReport(endpoint, resolvedActionName, status, extractHttpStatus(result.error), result.logId ?? null, {
-        responseSummary,
-        errorMessage,
-        dependencyStrategy: prepared.dependencyStrategy,
-        dependencySource: prepared.dependencySource,
-        classificationReason: this.explainClassification(status, result.error),
-        availableScopes,
-      });
+      return this.buildReport(
+        endpoint,
+        plan.resolvedActionName,
+        status,
+        extractHttpStatus(result.error),
+        result.logId ?? null,
+        {
+          responseSummary: summarizePayload(result.successful ? result.data : result.error),
+          errorMessage: result.successful ? null : summarizePayload(result.error),
+          classificationReason: this.explainClassification(status, result.error),
+          actionResolution: plan.actionResolution,
+          actionCandidates: plan.actionCandidates,
+          planSteps: plan.steps.map(renderPlanningStep),
+          availableScopes,
+        }
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = this.classifyErrorMessage(message, null);
-
-      return this.buildReport(endpoint, resolvedActionName, status, extractHttpStatus(error), null, {
+      const status = this.classifyErrorMessage(message, extractHttpStatus(error));
+      return this.buildReport(endpoint, plan.resolvedActionName, status, extractHttpStatus(error), null, {
         responseSummary: message,
         errorMessage: message,
-        dependencyStrategy: null,
-        dependencySource: null,
         classificationReason: this.explainClassification(status, error),
+        actionResolution: plan.actionResolution,
+        actionCandidates: plan.actionCandidates,
+        planSteps: plan.steps.map(renderPlanningStep),
         availableScopes,
       });
     }
   }
 
-  private async resolveActionName(toolSlug: string): Promise<string | null> {
-    const mapped = Object.prototype.hasOwnProperty.call(ACTION_MAP, toolSlug)
-      ? ACTION_MAP[toolSlug]
-      : toolSlug;
-    if (mapped === null) {
+  private async resolveAction(endpoint: EndpointSpec): Promise<ActionResolution> {
+    const exact = await this.lookupAction(endpoint.tool_slug);
+    if (exact) {
+      return {
+        actionName: exact.function.name,
+        confidence: 1,
+        exactMatch: true,
+        reason: `Exact Composio action match found for ${endpoint.tool_slug}`,
+        candidates: [{ actionName: exact.function.name, score: 1, reason: "Exact tool slug match" }],
+      };
+    }
+
+    const generatedCandidates = generateCandidateActionNames(endpoint);
+    const discovered: Array<{ actionName: string; score: number; reason: string }> = [];
+    for (const candidateName of generatedCandidates) {
+      const tool = await this.lookupAction(candidateName);
+      if (tool) {
+        discovered.push({
+          actionName: tool.function.name,
+          score: 10 - discovered.length,
+          reason: "Generated from endpoint intent and confirmed against live Composio metadata",
+        });
+      }
+    }
+    if (discovered[0]) {
+      return {
+        actionName: discovered[0].actionName,
+        confidence: discovered[0].score,
+        exactMatch: false,
+        reason: `Resolved ${endpoint.tool_slug} via runtime candidate generation from the endpoint method, path, and parameters`,
+        candidates: discovered,
+      };
+    }
+
+    return {
+      actionName: null,
+      confidence: 0,
+      exactMatch: false,
+      reason: `No runtime-generated candidate resolved to a live Composio action for ${endpoint.tool_slug}`,
+      candidates: generatedCandidates.map((candidateName, index) => ({
+        actionName: candidateName,
+        score: Math.max(1, generatedCandidates.length - index),
+        reason: "Candidate generated from endpoint intent but not found in the live toolkit",
+      })),
+    };
+  }
+
+  private async lookupAction(actionName: string): Promise<ToolDefinition | null> {
+    if (this.actionLookup.has(actionName)) {
+      return this.actionLookup.get(actionName) ?? null;
+    }
+
+    try {
+      const tools = (await this.composio.tools.get(USER_ID, actionName)) as ToolDefinition[];
+      const tool = tools[0] ?? null;
+      this.actionLookup.set(actionName, tool);
+      return tool;
+    } catch {
+      this.actionLookup.set(actionName, null);
       return null;
     }
-    if (await this.actionExists(mapped)) {
-      return mapped;
-    }
-    if (mapped !== toolSlug && (await this.actionExists(toolSlug))) {
-      return toolSlug;
-    }
-    return null;
   }
 
-  private async actionExists(actionName: string): Promise<boolean> {
-    if (this.actionCache.has(actionName)) {
-      return this.actionCache.get(actionName) ?? false;
+  private async planEndpoint(endpoint: EndpointSpec, resolution: ActionResolution): Promise<ExecutionPlan> {
+    const actionName = resolution.actionName;
+    if (!actionName) {
+      return {
+        resolvedActionName: null,
+        actionResolution: resolution.reason,
+        actionCandidates: resolution.candidates,
+        steps: [],
+        arguments: {},
+      };
     }
-    try {
-      await this.composio.tools.get(USER_ID, actionName);
-      this.actionCache.set(actionName, true);
-      return true;
-    } catch {
-      this.actionCache.set(actionName, false);
-      return false;
+
+    const tool = this.getToolDefinition(endpoint.toolkit, actionName);
+    const intent = analyzeIntent(endpoint);
+    const properties = tool?.function.parameters?.properties ?? {};
+    const steps: PlanningStep[] = [];
+    const seedArguments: Record<string, unknown> = {};
+
+    if ("recipient_email" in properties) {
+      steps.push({
+        kind: "resolve_self_email",
+        reason: "The action needs a recipient, so the agent first resolves the authenticated Gmail address",
+      });
+    }
+
+    if ("message_id" in properties) {
+      steps.push({
+        kind: "resolve_message_id",
+        owned: intent.destructive,
+        reason: intent.destructive
+          ? "The endpoint mutates a message, so the agent needs a run-owned message ID"
+          : "The endpoint reads a specific message, so the agent first discovers a real message ID",
+      });
+    }
+
+    if ("event_id" in properties) {
+      steps.push({
+        kind: "resolve_event_id",
+        owned: intent.destructive,
+        reason: intent.destructive
+          ? "The endpoint deletes an event, so the agent needs a run-owned event ID"
+          : "The endpoint reads a specific event, so the agent first discovers a real event ID",
+      });
+    }
+
+    if ("calendar_id" in properties) {
+      seedArguments.calendar_id = "primary";
+    }
+
+    if ("format" in properties) {
+      seedArguments.format = "full";
+    }
+
+    if ("max_results" in properties) {
+      seedArguments.max_results = 5;
+    }
+
+    if ("query" in properties) {
+      seedArguments.query = intent.resource === "event" ? "" : "";
+    }
+
+    if ("q" in properties) {
+      seedArguments.q = "";
+    }
+
+    if ("verbose" in properties) {
+      seedArguments.verbose = false;
+    }
+
+    if ("single_events" in properties) {
+      seedArguments.single_events = true;
+    }
+
+    if ("timeMin" in properties || "time_min" in properties) {
+      seedArguments.timeMin = isoForGoogle(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+    }
+
+    if ("timeMax" in properties || "time_max" in properties) {
+      seedArguments.timeMax = isoForGoogle(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000));
+    }
+
+    if ("start_datetime" in properties || "end_datetime" in properties || "timezone" in properties) {
+      const window = buildUtcEventWindow();
+      seedArguments.start_datetime = window.start;
+      seedArguments.end_datetime = window.end;
+      seedArguments.timezone = TIMEZONE;
+      seedArguments.summary = EVENT_TITLE;
+      seedArguments.description = `Temporary event created by the endpoint tester agent (${RUN_ID}).`;
+      if ("send_updates" in properties) {
+        seedArguments.send_updates = false;
+      }
+    }
+
+    if ("subject" in properties) {
+      seedArguments.subject =
+        actionName.includes("DRAFT")
+          ? `${EMAIL_SUBJECT} draft`
+          : EMAIL_SUBJECT;
+    }
+
+    if ("body" in properties) {
+      seedArguments.body = actionName.includes("DRAFT")
+        ? `Draft generated by the endpoint tester agent at ${new Date().toISOString()}.`
+        : `This email was generated by the endpoint tester agent at ${new Date().toISOString()}.`;
+    }
+
+    return {
+      resolvedActionName: actionName,
+      actionResolution: resolution.reason,
+      actionCandidates: resolution.candidates,
+      steps,
+      arguments: seedArguments,
+    };
+  }
+
+  private async executePlanningSteps(steps: PlanningStep[]) {
+    for (const step of steps) {
+      if (step.kind === "resolve_self_email") {
+        await this.ensureSelfEmail();
+      }
+      if (step.kind === "resolve_message_id") {
+        if (step.owned) {
+          await this.ensureOwnedMessageId();
+        } else {
+          await this.ensureListedMessageId();
+        }
+      }
+      if (step.kind === "resolve_event_id") {
+        if (step.owned) {
+          await this.ensureOwnedEventId();
+        } else {
+          await this.ensureListedEventId();
+        }
+      }
     }
   }
 
-  private async buildArguments(endpoint: EndpointSpec, resolvedActionName: string) {
-    switch (resolvedActionName) {
-      case "GMAIL_GET_PROFILE":
-        return { arguments: {}, dependencyStrategy: null, dependencySource: null };
-      case "GMAIL_LIST_MESSAGES":
-        return {
-          arguments: { user_id: "me", max_results: 5 },
-          dependencyStrategy: "direct_execute",
-          dependencySource: null,
-        };
-      case "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID": {
-        const messageId = await this.ensureMessageId();
-        return {
-          arguments: { user_id: "me", message_id: messageId, format: "full" },
-          dependencyStrategy: "list_messages_then_fetch",
-          dependencySource: messageId,
-        };
-      }
-      case "GMAIL_SEND_EMAIL": {
-        const recipient = await this.ensureSelfEmail();
-        return {
-          arguments: {
-            user_id: "me",
-            recipient_email: recipient,
-            subject: EMAIL_SUBJECT,
-            body: `This email was generated by the endpoint tester agent at ${new Date().toISOString()}.`,
-          },
-          dependencyStrategy: "profile_then_send_to_self",
-          dependencySource: recipient,
-        };
-      }
-      case "GMAIL_LIST_LABELS":
-        return { arguments: { user_id: "me" }, dependencyStrategy: "direct_execute", dependencySource: null };
-      case "GMAIL_CREATE_EMAIL_DRAFT": {
-        const recipient = await this.ensureSelfEmail();
-        return {
-          arguments: {
-            user_id: "me",
-            recipient_email: recipient,
-            subject: `${EMAIL_SUBJECT} draft`,
-            body: `Draft generated by the endpoint tester agent at ${new Date().toISOString()}.`,
-          },
-          dependencyStrategy: "profile_then_create_draft",
-          dependencySource: recipient,
-        };
-      }
-      case "GMAIL_LIST_THREADS":
-        return {
-          arguments: { user_id: "me", max_results: 5, verbose: false, query: "" },
-          dependencyStrategy: "direct_execute",
-          dependencySource: null,
-        };
-      case "GMAIL_MOVE_TO_TRASH": {
-        const messageId = await this.ensureOwnedMessageId();
-        return {
-          arguments: { user_id: "me", message_id: messageId },
-          dependencyStrategy: "send_self_email_then_trash",
-          dependencySource: messageId,
-        };
-      }
-      case "GOOGLECALENDAR_LIST_CALENDARS":
-        return { arguments: {}, dependencyStrategy: "direct_execute", dependencySource: null };
-      case "GOOGLECALENDAR_CREATE_EVENT": {
-        const { start, end } = buildUtcEventWindow();
-        return {
-          arguments: {
-            calendar_id: "primary",
-            summary: EVENT_TITLE,
-            description: `Temporary event created by the endpoint tester agent (${RUN_ID}).`,
-            start_datetime: start,
-            end_datetime: end,
-            timezone: TIMEZONE,
-            send_updates: false,
-          },
-          dependencyStrategy: "create_temporary_event",
-          dependencySource: EVENT_TITLE,
-        };
-      }
-      case "GOOGLECALENDAR_FIND_EVENT":
-        return {
-          arguments: {
-            calendar_id: "primary",
-            query: "",
-            max_results: 5,
-            single_events: true,
-            timeMin: isoForGoogle(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
-            timeMax: isoForGoogle(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)),
-          },
-          dependencyStrategy: "list_events_on_primary_calendar",
-          dependencySource: "primary",
-        };
-      case "GOOGLECALENDAR_EVENTS_GET": {
-        const eventId = await this.ensureEventId();
-        return {
-          arguments: { calendar_id: "primary", event_id: eventId },
-          dependencyStrategy: "create_or_find_event_then_get",
-          dependencySource: eventId,
-        };
-      }
-      case "GOOGLECALENDAR_DELETE_EVENT": {
-        const eventId = await this.ensureOwnedEventId();
-        return {
-          arguments: { calendar_id: "primary", event_id: eventId },
-          dependencyStrategy: "create_temporary_event_then_delete",
-          dependencySource: eventId,
-        };
-      }
-      default:
-        return {
-          arguments: buildFallbackArguments(endpoint),
-          dependencyStrategy: "fallback_mapping",
-          dependencySource: null,
-        };
+  private composeArguments(
+    endpoint: EndpointSpec,
+    actionName: string,
+    seedArguments: Record<string, unknown>
+  ): Record<string, unknown> {
+    const tool = this.getToolDefinition(endpoint.toolkit, actionName);
+    const properties = tool?.function.parameters?.properties ?? {};
+    const arguments_: Record<string, unknown> = { ...seedArguments };
+
+    if ("user_id" in properties) {
+      arguments_.user_id = "me";
     }
+
+    if ("recipient_email" in properties && this.selfEmail) {
+      arguments_.recipient_email = this.selfEmail;
+    }
+
+    if ("message_id" in properties) {
+      const intent = analyzeIntent(endpoint);
+      arguments_.message_id = intent.destructive ? this.ownedMessageId : this.listedMessageId;
+    }
+
+    if ("event_id" in properties) {
+      const intent = analyzeIntent(endpoint);
+      arguments_.event_id = intent.destructive ? this.createdEventId : this.listedEventId;
+    }
+
+    if ("query" in properties && actionName.includes("GOOGLECALENDAR_FIND_EVENT")) {
+      arguments_.query = "";
+    }
+
+    if ("timeMin" in properties) {
+      arguments_.timeMin = isoForGoogle(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+    }
+    if ("timeMax" in properties) {
+      arguments_.timeMax = isoForGoogle(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000));
+    }
+
+    return arguments_;
+  }
+
+  private getToolDefinition(toolkit: ToolkitSlug, actionName: string): ToolDefinition | undefined {
+    return (this.toolCatalog.get(toolkit) ?? []).find((tool) => tool.function.name === actionName);
   }
 
   private async ensureSelfEmail(): Promise<string> {
     if (this.selfEmail) {
       return this.selfEmail;
     }
-    const result = await this.executeAction("gmail", "GMAIL_GET_PROFILE", {});
+
+    const result = await this.composioExecute("gmail", "GMAIL_GET_PROFILE", {});
+    if (!result.successful) {
+      throw new Error(summarizePayload(result.error));
+    }
+
     const email = getStringAtPath(result.data, ["emailAddress"]);
     if (!email) {
-      throw new Error("Unable to resolve authenticated Gmail address from GMAIL_GET_PROFILE");
+      throw new Error("Unable to resolve authenticated Gmail address from profile");
     }
+
     this.selfEmail = email;
     return email;
   }
 
-  private async ensureMessageId(): Promise<string> {
+  private async ensureListedMessageId(): Promise<string> {
     if (this.listedMessageId) {
       return this.listedMessageId;
     }
-    const result = await this.executeAction("gmail", "GMAIL_LIST_MESSAGES", {
+
+    const result = await this.composioExecute("gmail", "GMAIL_LIST_MESSAGES", {
       user_id: "me",
       max_results: 5,
     });
+    if (!result.successful) {
+      throw new Error(summarizePayload(result.error));
+    }
+
     const messageId = findFirstId(result.data, ["messages"]);
     if (!messageId) {
-      throw new Error("Unable to find a Gmail message ID from GMAIL_LIST_MESSAGES");
+      throw new Error("Unable to discover a real Gmail message ID from the list endpoint");
     }
+
     this.listedMessageId = messageId;
     return messageId;
   }
@@ -415,28 +589,32 @@ class EndpointTesterAgent {
     }
 
     const recipient = await this.ensureSelfEmail();
-    await this.executeAction("gmail", "GMAIL_SEND_EMAIL", {
+    const sendResult = await this.composioExecute("gmail", "GMAIL_SEND_EMAIL", {
       user_id: "me",
       recipient_email: recipient,
       subject: EMAIL_SUBJECT,
-      body: `This message was created for trash validation at ${new Date().toISOString()}.`,
-    }).then((result) => {
-      if (!result.successful) {
-        throw new Error(summarizePayload(result.error));
-      }
-      const sentId = findFirstStringByKey(result.data, "id");
-      if (sentId) {
-        this.ownedMessageId = sentId;
-      }
+      body: `This message was created for endpoint trash validation at ${new Date().toISOString()}.`,
     });
+    if (!sendResult.successful) {
+      throw new Error(summarizePayload(sendResult.error));
+    }
+
+    const sentId = findFirstStringByKey(sendResult.data, "id");
+    if (sentId) {
+      this.ownedMessageId = sentId;
+      return sentId;
+    }
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await Bun.sleep(2000);
-      const listResult = await this.executeAction("gmail", "GMAIL_LIST_MESSAGES", {
+      const listResult = await this.composioExecute("gmail", "GMAIL_LIST_MESSAGES", {
         user_id: "me",
         q: `subject:"${EMAIL_SUBJECT}"`,
         max_results: 1,
       });
+      if (!listResult.successful) {
+        throw new Error(summarizePayload(listResult.error));
+      }
       const messageId = findFirstId(listResult.data, ["messages"]);
       if (messageId) {
         this.ownedMessageId = messageId;
@@ -444,17 +622,18 @@ class EndpointTesterAgent {
       }
     }
 
-    throw new Error("Unable to locate the run-owned Gmail message after sending it to self");
+    throw new Error("Unable to locate a run-owned Gmail message after sending it to self");
   }
 
-  private async ensureEventId(): Promise<string> {
+  private async ensureListedEventId(): Promise<string> {
     if (this.listedEventId) {
       return this.listedEventId;
     }
     if (this.createdEventId && !this.eventDeleted) {
       return this.createdEventId;
     }
-    const listResult = await this.executeAction("googlecalendar", "GOOGLECALENDAR_FIND_EVENT", {
+
+    const result = await this.composioExecute("googlecalendar", "GOOGLECALENDAR_FIND_EVENT", {
       calendar_id: "primary",
       query: "",
       max_results: 1,
@@ -462,12 +641,17 @@ class EndpointTesterAgent {
       timeMin: isoForGoogle(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
       timeMax: isoForGoogle(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)),
     });
-    const foundId = findFirstId(listResult.data, ["event_data", "items", "events", "data"]);
-    if (foundId) {
-      this.listedEventId = foundId;
-      return foundId;
+    if (!result.successful) {
+      throw new Error(summarizePayload(result.error));
     }
-    return this.ensureOwnedEventId();
+
+    const eventId = findFirstId(result.data, ["event_data", "items", "events"]);
+    if (!eventId) {
+      throw new Error("Unable to discover a real Calendar event ID from the list endpoint");
+    }
+
+    this.listedEventId = eventId;
+    return eventId;
   }
 
   private async ensureOwnedEventId(): Promise<string> {
@@ -476,10 +660,10 @@ class EndpointTesterAgent {
     }
 
     const { start, end } = buildUtcEventWindow();
-    const createResult = await this.executeAction("googlecalendar", "GOOGLECALENDAR_CREATE_EVENT", {
+    const createResult = await this.composioExecute("googlecalendar", "GOOGLECALENDAR_CREATE_EVENT", {
       calendar_id: "primary",
       summary: EVENT_TITLE,
-      description: `Temporary event created for endpoint deletion testing (${RUN_ID}).`,
+      description: `Temporary event created by the endpoint tester agent (${RUN_ID}).`,
       start_datetime: start,
       end_datetime: end,
       timezone: TIMEZONE,
@@ -490,31 +674,32 @@ class EndpointTesterAgent {
     }
 
     const eventId =
-      findFirstStringByKey(createResult.data, "id") ??
-      findFirstStringByKey(createResult.data, "event_id");
+      findFirstStringByKey(createResult.data, "event_id") ??
+      findFirstStringByKey(createResult.data, "id");
     if (!eventId) {
-      throw new Error("Unable to determine event ID from GOOGLECALENDAR_CREATE_EVENT");
+      throw new Error("Unable to determine a run-owned Calendar event ID from create-event output");
     }
+
     this.createdEventId = eventId;
     this.eventDeleted = false;
     return eventId;
   }
 
-  private async executeAction(
+  private async composioExecute(
     toolkit: ToolkitSlug,
     actionName: string,
-    args: Record<string, unknown>
+    input: Record<string, unknown>
   ): Promise<ExecutionResult> {
     const account = this.accounts.get(toolkit);
     if (!account) {
       throw new Error(`No connected account for toolkit ${toolkit}`);
     }
-    return (await this.composio.tools.execute(actionName, {
-      userId: USER_ID,
+
+    return await this.composio.execute({
+      actionName,
       connectedAccountId: account.id,
-      dangerouslySkipVersionCheck: true,
-      arguments: args,
-    })) as ExecutionResult;
+      input,
+    });
   }
 
   private classifyResult(error: unknown, successful: boolean): EndpointStatus {
@@ -538,7 +723,7 @@ class EndpointTesterAgent {
     if (
       httpStatus === 404 ||
       normalized.includes("not found") ||
-      normalized.includes("tool not found") ||
+      normalized.includes("tool_not_found") ||
       normalized.includes("does not exist")
     ) {
       return "invalid_endpoint";
@@ -551,9 +736,9 @@ class EndpointTesterAgent {
       case "valid":
         return "Composio execution completed successfully";
       case "invalid_endpoint":
-        return `Composio or provider reported a missing endpoint/action: ${summarizePayload(value)}`;
+        return `The action or provider endpoint could not be found: ${summarizePayload(value)}`;
       case "insufficient_scopes":
-        return `Composio or provider reported a permission or scope failure: ${summarizePayload(value)}`;
+        return `The provider reported a permission or scope failure: ${summarizePayload(value)}`;
       default:
         return `Unexpected execution failure: ${summarizePayload(value)}`;
     }
@@ -572,31 +757,36 @@ class EndpointTesterAgent {
         this.selfEmail = email;
       }
     }
+
     if (toolSlug === "GMAIL_LIST_MESSAGES") {
       const messageId = findFirstId(data, ["messages"]);
       if (messageId) {
         this.listedMessageId = messageId;
       }
     }
+
     if (toolSlug === "GMAIL_SEND_MESSAGE") {
       const messageId = findFirstStringByKey(data, "id");
       if (messageId) {
         this.ownedMessageId = messageId;
       }
     }
+
     if (toolSlug === "GOOGLECALENDAR_CREATE_EVENT") {
-      const eventId = findFirstStringByKey(data, "id") ?? findFirstStringByKey(data, "event_id");
+      const eventId = findFirstStringByKey(data, "event_id") ?? findFirstStringByKey(data, "id");
       if (eventId) {
         this.createdEventId = eventId;
         this.eventDeleted = false;
       }
     }
+
     if (toolSlug === "GOOGLECALENDAR_LIST_EVENTS") {
-      const eventId = findFirstId(data, ["event_data", "items"]);
+      const eventId = findFirstId(data, ["event_data", "items", "events"]);
       if (eventId) {
         this.listedEventId = eventId;
       }
     }
+
     if (toolSlug === "GOOGLECALENDAR_DELETE_EVENT") {
       this.eventDeleted = true;
     }
@@ -611,9 +801,10 @@ class EndpointTesterAgent {
     details: {
       responseSummary: string;
       errorMessage: string | null;
-      dependencyStrategy: string | null;
-      dependencySource: string | null;
       classificationReason: string;
+      actionResolution: string;
+      actionCandidates: Array<{ actionName: string; score: number; reason: string }>;
+      planSteps: string[];
       availableScopes: string[];
     }
   ): EndpointReport {
@@ -629,9 +820,10 @@ class EndpointTesterAgent {
       errorMessage: details.errorMessage,
       requiredScopes: endpoint.required_scopes,
       availableScopes: details.availableScopes,
-      dependencyStrategy: details.dependencyStrategy,
-      dependencySource: details.dependencySource,
       classificationReason: details.classificationReason,
+      actionResolution: details.actionResolution,
+      actionCandidates: details.actionCandidates,
+      planSteps: details.planSteps,
       logId,
     };
   }
@@ -652,24 +844,219 @@ class EndpointTesterAgent {
   }
 }
 
-function buildFallbackArguments(endpoint: EndpointSpec) {
-  const args: Record<string, unknown> = {};
-  for (const query of endpoint.parameters.query) {
-    if (query.name === "maxResults") {
-      args.max_results = 5;
-    } else if (query.name === "showHidden") {
-      args.show_hidden = false;
+function analyzeIntent(endpoint: EndpointSpec): EndpointIntent {
+  const path = endpoint.path.toLowerCase();
+  const hasPathId = endpoint.parameters.path.length > 0;
+
+  const resource: EndpointIntent["resource"] = path.includes("/messages")
+    ? "message"
+    : path.includes("/threads")
+      ? "thread"
+      : path.includes("/labels")
+        ? "label"
+        : path.includes("/profile")
+          ? "profile"
+          : path.includes("/drafts")
+            ? "draft"
+            : path.includes("/events")
+              ? "event"
+              : path.includes("calendarlist")
+                ? "calendar"
+                : path.includes("/reminders")
+                  ? "reminder"
+                  : "unknown";
+
+  let operation: EndpointIntent["operation"] = "unknown";
+  if (endpoint.method === "GET" && !hasPathId) operation = "list";
+  if (endpoint.method === "GET" && hasPathId) operation = "get";
+  if (endpoint.method === "DELETE") operation = "delete";
+  if (endpoint.method === "POST" && path.endsWith("/send")) operation = "send";
+  if (endpoint.method === "POST" && path.endsWith("/trash")) operation = "trash";
+  if (endpoint.method === "POST" && path.endsWith("/archive")) operation = "archive";
+  if (endpoint.method === "POST" && operation === "unknown") operation = "create";
+
+  return {
+    resource,
+    operation,
+    hasPathId,
+    needsBody: endpoint.parameters.body !== null,
+    destructive: operation === "trash" || operation === "delete" || operation === "archive",
+  };
+}
+
+function scoreCandidate(endpoint: EndpointSpec, intent: EndpointIntent, tool: ToolDefinition) {
+  const name = tool.function.name;
+  const tokens = tokenize(name);
+  let score = 0;
+  const reasons: string[] = [];
+
+  const resourceTokens: Record<EndpointIntent["resource"], string[]> = {
+    message: ["message", "messages", "email", "emails"],
+    thread: ["thread", "threads"],
+    label: ["label", "labels"],
+    profile: ["profile"],
+    draft: ["draft", "drafts"],
+    event: ["event", "events"],
+    calendar: ["calendar", "calendars"],
+    reminder: ["reminder", "reminders"],
+    unknown: [],
+  };
+
+  const operationTokens: Record<EndpointIntent["operation"], string[]> = {
+    list: ["list", "find"],
+    get: ["get", "fetch"],
+    create: ["create", "insert"],
+    send: ["send"],
+    trash: ["trash"],
+    delete: ["delete"],
+    archive: ["archive"],
+    unknown: [],
+  };
+
+  const matchingResource = resourceTokens[intent.resource].filter((token) => tokens.has(token));
+  if (matchingResource.length > 0) {
+    score += 3;
+    reasons.push(`resource match: ${matchingResource.join(", ")}`);
+  } else if (intent.resource !== "unknown") {
+    score -= 2;
+  }
+
+  const matchingOperation = operationTokens[intent.operation].filter((token) => tokens.has(token));
+  if (matchingOperation.length > 0) {
+    score += 4;
+    reasons.push(`operation match: ${matchingOperation.join(", ")}`);
+  } else if (intent.operation !== "unknown") {
+    score -= 1;
+  }
+
+  if (intent.hasPathId && toolRequiresIdentifier(tool)) {
+    score += 2;
+    reasons.push("identifier requirement aligns");
+  }
+
+  if (intent.needsBody && toolAcceptsBody(tool)) {
+    score += 1;
+    reasons.push("body-capable action");
+  }
+
+  const slugTokenOverlap = intersectSets(tokenize(endpoint.tool_slug), tokens);
+  if (slugTokenOverlap.length > 0) {
+    score += Math.min(3, slugTokenOverlap.length);
+    reasons.push(`slug overlap: ${slugTokenOverlap.join(", ")}`);
+  }
+
+  const descriptionOverlap = intersectSets(tokenize(endpoint.description), tokens);
+  if (descriptionOverlap.length > 0) {
+    score += 1;
+    reasons.push(`description overlap: ${descriptionOverlap.join(", ")}`);
+  }
+
+  return {
+    tool,
+    score,
+    reason: reasons.join("; ") || "weak match",
+  };
+}
+
+function generateCandidateActionNames(endpoint: EndpointSpec) {
+  const intent = analyzeIntent(endpoint);
+  const prefix = endpoint.toolkit === "gmail" ? "GMAIL" : "GOOGLECALENDAR";
+  const resourceVariants: Record<EndpointIntent["resource"], string[]> = {
+    message: ["MESSAGE", "EMAIL"],
+    thread: ["THREAD"],
+    label: ["LABEL"],
+    profile: ["PROFILE"],
+    draft: ["DRAFT", "EMAIL_DRAFT"],
+    event: ["EVENT", "EVENTS"],
+    calendar: ["CALENDAR", "CALENDARS", "CALENDAR_LIST"],
+    reminder: ["REMINDER", "REMINDERS"],
+    unknown: [],
+  };
+  const operationVariants: Record<EndpointIntent["operation"], string[]> = {
+    list: ["LIST", "FIND"],
+    get: ["GET", "FETCH"],
+    create: ["CREATE", "INSERT"],
+    send: ["SEND"],
+    trash: ["MOVE_TO_TRASH", "TRASH"],
+    delete: ["DELETE"],
+    archive: ["ARCHIVE"],
+    unknown: [],
+  };
+
+  const candidates = new Set<string>();
+  candidates.add(endpoint.tool_slug);
+
+  for (const operation of operationVariants[intent.operation]) {
+    for (const resource of resourceVariants[intent.resource]) {
+      candidates.add(`${prefix}_${operation}_${resource}`);
+      candidates.add(`${prefix}_${resource}_${operation}`);
     }
   }
-  for (const pathParam of endpoint.parameters.path) {
-    if (pathParam.name === "eventId") {
-      args.event_id = "placeholder";
-    }
-    if (pathParam.name === "messageId") {
-      args.message_id = "placeholder";
-    }
+
+  if (endpoint.toolkit === "gmail" && intent.resource === "message" && intent.operation === "get" && intent.hasPathId) {
+    candidates.add("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID");
   }
-  return args;
+  if (endpoint.toolkit === "gmail" && intent.resource === "draft" && intent.operation === "create") {
+    candidates.add("GMAIL_CREATE_EMAIL_DRAFT");
+  }
+  if (endpoint.toolkit === "gmail" && intent.resource === "message" && intent.operation === "send") {
+    candidates.add("GMAIL_SEND_EMAIL");
+  }
+  if (endpoint.toolkit === "gmail" && intent.resource === "message" && intent.operation === "trash") {
+    candidates.add("GMAIL_MOVE_TO_TRASH");
+  }
+  if (endpoint.toolkit === "googlecalendar" && intent.resource === "event" && intent.operation === "get") {
+    candidates.add("GOOGLECALENDAR_EVENTS_GET");
+  }
+  if (endpoint.toolkit === "googlecalendar" && intent.resource === "event" && intent.operation === "list") {
+    candidates.add("GOOGLECALENDAR_FIND_EVENT");
+    candidates.add("GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS");
+  }
+  if (endpoint.toolkit === "googlecalendar" && intent.resource === "calendar" && intent.operation === "list") {
+    candidates.add("GOOGLECALENDAR_LIST_CALENDARS");
+  }
+
+  return [...candidates];
+}
+
+function toolRequiresIdentifier(tool: ToolDefinition) {
+  const properties = tool.function.parameters?.properties ?? {};
+  return "message_id" in properties || "event_id" in properties;
+}
+
+function toolAcceptsBody(tool: ToolDefinition) {
+  const properties = tool.function.parameters?.properties ?? {};
+  return (
+    "body" in properties ||
+    "subject" in properties ||
+    "start_datetime" in properties ||
+    "summary" in properties
+  );
+}
+
+function tokenize(value: string) {
+  return new Set(
+    value
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+}
+
+function intersectSets(left: Set<string>, right: Set<string>) {
+  return [...left].filter((token) => right.has(token));
+}
+
+function renderPlanningStep(step: PlanningStep) {
+  if (step.kind === "resolve_self_email") {
+    return step.reason;
+  }
+  if (step.kind === "resolve_message_id") {
+    return `${step.reason}${step.owned ? " (owned fixture)" : " (existing fixture)"}`;
+  }
+  return `${step.reason}${step.owned ? " (owned fixture)" : " (existing fixture)"}`;
 }
 
 function buildUtcEventWindow() {
@@ -721,6 +1108,13 @@ function getStringAtPath(value: unknown, path: string[]): string | null {
 }
 
 function getStringByKey(value: unknown, wantedKey: string): string | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = getStringByKey(item, wantedKey);
+      if (nested) return nested;
+    }
+    return null;
+  }
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -737,6 +1131,13 @@ function getStringByKey(value: unknown, wantedKey: string): string | null {
 }
 
 function getNumberByKey(value: unknown, wantedKey: string): number | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = getNumberByKey(item, wantedKey);
+      if (nested != null) return nested;
+    }
+    return null;
+  }
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -765,25 +1166,22 @@ function findFirstId(value: unknown, preferredKeys: string[]): string | null {
   if (!value || typeof value !== "object") {
     return null;
   }
+
   const record = value as Record<string, unknown>;
   for (const key of preferredKeys) {
     const candidate = record[key];
-    if (Array.isArray(candidate)) {
-      const nested = findFirstId(candidate, preferredKeys);
-      if (nested) {
-        return nested;
+    if (candidate) {
+      const found = findFirstId(candidate, preferredKeys);
+      if (found) {
+        return found;
       }
     }
   }
-  if (typeof record.id === "string") {
-    return record.id;
-  }
-  if (typeof record.message_id === "string") {
-    return record.message_id;
-  }
-  if (typeof record.event_id === "string") {
-    return record.event_id;
-  }
+
+  if (typeof record.id === "string") return record.id;
+  if (typeof record.message_id === "string") return record.message_id;
+  if (typeof record.event_id === "string") return record.event_id;
+
   for (const nested of Object.values(record)) {
     const found = findFirstId(nested, preferredKeys);
     if (found) {
@@ -806,13 +1204,14 @@ function findFirstStringByKey(value: unknown, wantedKey: string): string | null 
   if (!value || typeof value !== "object") {
     return null;
   }
+
   for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
     if (key === wantedKey && typeof nestedValue === "string") {
       return nestedValue;
     }
-    const nested = findFirstStringByKey(nestedValue, wantedKey);
-    if (nested) {
-      return nested;
+    const found = findFirstStringByKey(nestedValue, wantedKey);
+    if (found) {
+      return found;
     }
   }
   return null;
@@ -831,10 +1230,9 @@ async function main() {
     throw new Error("COMPOSIO_API_KEY is required. Run setup.sh or export the key before executing the agent.");
   }
 
-  const outputPath = getOutputPath();
   await mkdir("reports", { recursive: true });
   const agent = new EndpointTesterAgent(process.env.COMPOSIO_API_KEY);
-  await agent.run(outputPath);
+  await agent.run(getOutputPath());
 }
 
 await main();
