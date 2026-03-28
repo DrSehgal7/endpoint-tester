@@ -92,6 +92,10 @@ export function buildEndpointReport(
     actionResolution: details.actionResolution,
     actionCandidates: details.actionCandidates,
     planSteps: details.planSteps,
+    attemptCount: details.attemptCount,
+    retried: details.attemptCount > 1,
+    executionMs: details.executionMs,
+    scopeSuggestions: details.scopeSuggestions,
     logId,
   };
 }

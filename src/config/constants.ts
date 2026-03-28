@@ -3,8 +3,12 @@ import type { EndpointCatalog, EndpointSpec, RunContext, ToolkitSlug } from "../
 
 export const USER_ID = "candidate";
 export const DEFAULT_OUTPUT = "reports/endpoint-test-report.json";
+export const DEFAULT_DASHBOARD_OUTPUT = "reports/dashboard.html";
 export const TIMEZONE = "UTC";
 export const TOOLKITS = ["gmail", "googlecalendar"] as const satisfies readonly ToolkitSlug[];
+export const TOOLKIT_CONCURRENCY = TOOLKITS.length;
+export const PER_TOOLKIT_COOLDOWN_MS = 300;
+export const MAX_RETRIES = 2;
 
 export const RUN_CONTEXT: RunContext = createRunContext();
 

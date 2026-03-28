@@ -14,11 +14,28 @@ export function summarizePayload(value: unknown, maxLength = 220): string {
   }
 }
 
+export function serializePayload(value: unknown): string {
+  if (value == null) {
+    return "No response payload";
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 export function extractHttpStatus(value: unknown): number | null {
+  const normalizedValue = normalizeStatusSource(value);
   const candidates = [
-    getNumberByKey(value, "status"),
-    getNumberByKey(value, "statusCode"),
-    getNumberByKey(value, "code"),
+    getNumberByKey(normalizedValue, "status"),
+    getNumberByKey(normalizedValue, "statusCode"),
+    getNumberByKey(normalizedValue, "code"),
   ].filter((candidate): candidate is number => typeof candidate === "number");
 
   return candidates.find((candidate) => candidate >= 100 && candidate <= 599) ?? null;
@@ -168,4 +185,21 @@ export function findFirstStringByKey(value: unknown, wantedKey: string): string 
   }
 
   return null;
+}
+
+function normalizeStatusSource(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
 }

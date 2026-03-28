@@ -147,6 +147,9 @@ export type EndpointReportDetails = {
   actionCandidates: ActionCandidate[];
   planSteps: string[];
   availableScopes: string[];
+  attemptCount: number;
+  executionMs: number;
+  scopeSuggestions: string[];
 };
 
 export type EndpointReport = {
@@ -165,12 +168,24 @@ export type EndpointReport = {
   actionResolution: string;
   actionCandidates: ActionCandidate[];
   planSteps: string[];
+  attemptCount: number;
+  retried: boolean;
+  executionMs: number;
+  scopeSuggestions: string[];
   logId: string | null;
+};
+
+export type ExecutionMetadata = {
+  mode: "toolkit_parallel";
+  toolkitConcurrency: number;
+  perToolkitCooldownMs: number;
+  maxRetries: number;
 };
 
 export type RunReport = {
   generatedAt: string;
   userId: string;
+  execution: ExecutionMetadata;
   accounts: Record<ToolkitSlug, { connectedAccountId: string | null; availableScopes: string[] }>;
   summary: Record<EndpointStatus, number>;
   results: EndpointReport[];

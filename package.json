@@ -1,6 +1,9 @@
 {
   "name": "endpoint-tester-interview",
   "private": true,
+  "scripts": {
+    "report": "bun src/main.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

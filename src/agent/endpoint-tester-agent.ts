@@ -1,7 +1,11 @@
+import { dirname, join } from "node:path";
 import { ENDPOINTS, RUN_CONTEXT, TOOLKITS } from "../config/constants";
+import { DEFAULT_DASHBOARD_OUTPUT, MAX_RETRIES, PER_TOOLKIT_COOLDOWN_MS, TOOLKIT_CONCURRENCY } from "../config/constants";
 import { createComposioClient } from "../lib/composio-client";
 import { analyzeIntent, buildUtcEventWindow, generateCandidateActionNames, isoForGoogle, renderPlanningStep } from "../utils/endpoint-helpers";
 import { buildEndpointReport, buildSummary, classifyErrorMessage, classifyResult, explainClassification, printReportSummary } from "../utils/reporting";
+import { buildScopeSuggestions } from "../utils/scope-suggestions";
+import { writeDashboard } from "../utils/dashboard";
 import type {
   ActionCandidate,
   ActionResolution,
@@ -15,13 +19,14 @@ import type {
   ToolkitSlug,
   ToolDefinition,
 } from "../types";
-import { extractHttpStatus, findFirstId, findFirstStringByKey, getStringAtPath, getStringByKey, summarizePayload } from "../utils/value-utils";
+import { extractHttpStatus, findFirstId, findFirstStringByKey, getStringAtPath, getStringByKey, serializePayload, summarizePayload } from "../utils/value-utils";
 
 export class EndpointTesterAgent {
   private readonly composio: ComposioWithExecute;
   private readonly accounts = new Map<ToolkitSlug, ConnectedAccount>();
   private readonly toolCatalog = new Map<ToolkitSlug, ToolDefinition[]>();
   private readonly actionLookup = new Map<string, ToolDefinition | null>();
+  private readonly lastExecutionAt = new Map<ToolkitSlug, number>();
 
   private selfEmail: string | null = null;
   private listedMessageId: string | null = null;
@@ -41,14 +46,28 @@ export class EndpointTesterAgent {
     await this.loadConnectedAccounts();
     await this.loadToolCatalogs();
 
-    const results: EndpointReport[] = [];
-    for (const endpoint of ENDPOINTS) {
-      results.push(await this.testEndpoint(endpoint));
-    }
+    const toolkitResults = await Promise.all(
+      TOOLKITS.map(async (toolkit) => ({
+        toolkit,
+        results: await this.runToolkitEndpoints(toolkit),
+      }))
+    );
+    const resultLookup = new Map(
+      toolkitResults.flatMap((entry) => entry.results.map((result) => [result.toolSlug, result] as const))
+    );
+    const results = ENDPOINTS.map((endpoint) => resultLookup.get(endpoint.tool_slug)).filter(
+      (result): result is EndpointReport => result !== undefined
+    );
 
     const report: RunReport = {
       generatedAt: new Date().toISOString(),
       userId: this.runContext.userId,
+      execution: {
+        mode: "toolkit_parallel",
+        toolkitConcurrency: TOOLKIT_CONCURRENCY,
+        perToolkitCooldownMs: PER_TOOLKIT_COOLDOWN_MS,
+        maxRetries: MAX_RETRIES,
+      },
       accounts: {
         gmail: {
           connectedAccountId: this.accounts.get("gmail")?.id ?? null,
@@ -64,8 +83,20 @@ export class EndpointTesterAgent {
     };
 
     await Bun.write(outputPath, JSON.stringify(report, null, 2));
+    await writeDashboard(report, this.getDashboardOutputPath(outputPath));
     printReportSummary(report, outputPath);
     return report;
+  }
+
+  private async runToolkitEndpoints(toolkit: ToolkitSlug): Promise<EndpointReport[]> {
+    const endpoints = ENDPOINTS.filter((endpoint) => endpoint.toolkit === toolkit);
+    const results: EndpointReport[] = [];
+
+    for (const endpoint of endpoints) {
+      results.push(await this.testEndpoint(endpoint));
+    }
+
+    return results;
   }
 
   private async loadConnectedAccounts(): Promise<void> {
@@ -97,6 +128,7 @@ export class EndpointTesterAgent {
   }
 
   private async testEndpoint(endpoint: EndpointSpec): Promise<EndpointReport> {
+    const startedAt = performance.now();
     const availableScopes = this.getAvailableScopes(endpoint.toolkit);
     const account = this.accounts.get(endpoint.toolkit);
 
@@ -109,6 +141,9 @@ export class EndpointTesterAgent {
         actionCandidates: [],
         planSteps: [],
         availableScopes,
+        attemptCount: 0,
+        executionMs: Math.round(performance.now() - startedAt),
+        scopeSuggestions: [],
       });
     }
 
@@ -122,6 +157,9 @@ export class EndpointTesterAgent {
         actionCandidates: resolution.candidates,
         planSteps: [],
         availableScopes,
+        attemptCount: 0,
+        executionMs: Math.round(performance.now() - startedAt),
+        scopeSuggestions: [],
       });
     }
 
@@ -135,8 +173,11 @@ export class EndpointTesterAgent {
       }
 
       const input = this.composeArguments(endpoint, plan.resolvedActionName, plan.arguments);
-      const result = await this.composioExecute(endpoint.toolkit, plan.resolvedActionName, input);
+      const execution = await this.composioExecuteDetailed(endpoint.toolkit, plan.resolvedActionName, input);
+      const result = execution.result;
       const status = classifyResult(result.error, result.successful);
+      const scopeSuggestions =
+        status === "insufficient_scopes" ? buildScopeSuggestions(endpoint, availableScopes) : [];
 
       this.captureRuntimeState(endpoint.tool_slug, result.data);
 
@@ -154,12 +195,17 @@ export class EndpointTesterAgent {
           actionCandidates: plan.actionCandidates,
           planSteps: plan.steps.map(renderPlanningStep),
           availableScopes,
+          attemptCount: execution.attemptCount,
+          executionMs: Math.round(performance.now() - startedAt),
+          scopeSuggestions,
         }
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const httpStatus = extractHttpStatus(error);
+      const httpStatus = extractHttpStatus(error) ?? extractHttpStatus(message);
       const status = classifyErrorMessage(message, httpStatus);
+      const scopeSuggestions =
+        status === "insufficient_scopes" ? buildScopeSuggestions(endpoint, availableScopes) : [];
 
       return buildEndpointReport(endpoint, plan.resolvedActionName, status, httpStatus, null, {
         responseSummary: message,
@@ -169,6 +215,9 @@ export class EndpointTesterAgent {
         actionCandidates: plan.actionCandidates,
         planSteps: plan.steps.map(renderPlanningStep),
         availableScopes,
+        attemptCount: 1,
+        executionMs: Math.round(performance.now() - startedAt),
+        scopeSuggestions,
       });
     }
   }
@@ -449,7 +498,7 @@ export class EndpointTesterAgent {
 
     const result = await this.composioExecute("gmail", "GMAIL_GET_PROFILE", {});
     if (!result.successful) {
-      throw new Error(summarizePayload(result.error));
+      throw new Error(serializePayload(result.error));
     }
 
     const email = getStringAtPath(result.data, ["emailAddress"]);
@@ -471,7 +520,7 @@ export class EndpointTesterAgent {
       max_results: 5,
     });
     if (!result.successful) {
-      throw new Error(summarizePayload(result.error));
+      throw new Error(serializePayload(result.error));
     }
 
     const messageId = findFirstId(result.data, ["messages"]);
@@ -496,7 +545,7 @@ export class EndpointTesterAgent {
       body: `This message was created for endpoint trash validation at ${new Date().toISOString()}.`,
     });
     if (!sendResult.successful) {
-      throw new Error(summarizePayload(sendResult.error));
+      throw new Error(serializePayload(sendResult.error));
     }
 
     const sentId = findFirstStringByKey(sendResult.data, "id");
@@ -513,7 +562,7 @@ export class EndpointTesterAgent {
         max_results: 1,
       });
       if (!listResult.successful) {
-        throw new Error(summarizePayload(listResult.error));
+        throw new Error(serializePayload(listResult.error));
       }
 
       const messageId = findFirstId(listResult.data, ["messages"]);
@@ -544,7 +593,7 @@ export class EndpointTesterAgent {
       timeMax: isoForGoogle(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)),
     });
     if (!result.successful) {
-      throw new Error(summarizePayload(result.error));
+      throw new Error(serializePayload(result.error));
     }
 
     const eventId = findFirstId(result.data, ["event_data", "items", "events"]);
@@ -572,7 +621,7 @@ export class EndpointTesterAgent {
       send_updates: false,
     });
     if (!createResult.successful) {
-      throw new Error(summarizePayload(createResult.error));
+      throw new Error(serializePayload(createResult.error));
     }
 
     const eventId =
@@ -592,16 +641,67 @@ export class EndpointTesterAgent {
     actionName: string,
     input: Record<string, unknown>
   ) {
+    const execution = await this.composioExecuteDetailed(toolkit, actionName, input);
+    return execution.result;
+  }
+
+  private async composioExecuteDetailed(
+    toolkit: ToolkitSlug,
+    actionName: string,
+    input: Record<string, unknown>
+  ): Promise<{ result: Awaited<ReturnType<ComposioWithExecute["execute"]>>; attemptCount: number }> {
     const account = this.accounts.get(toolkit);
     if (!account) {
       throw new Error(`No connected account for toolkit ${toolkit}`);
     }
 
-    return this.composio.execute({
-      actionName,
-      connectedAccountId: account.id,
-      input,
-    });
+    let attemptCount = 0;
+    let lastResult: Awaited<ReturnType<ComposioWithExecute["execute"]>> | null = null;
+    let lastError: unknown = null;
+
+    while (attemptCount <= MAX_RETRIES) {
+      attemptCount += 1;
+      await this.waitForToolkitSlot(toolkit);
+
+      try {
+        const result = await this.composio.execute({
+          actionName,
+          connectedAccountId: account.id,
+          input,
+        });
+        lastResult = result;
+
+        if (!shouldRetryResult(result) || attemptCount > MAX_RETRIES) {
+          return { result, attemptCount };
+        }
+      } catch (error) {
+        lastError = error;
+        if (!isTransientFailure(error) || attemptCount > MAX_RETRIES) {
+          throw error;
+        }
+      }
+
+      await Bun.sleep(getRetryDelayMs(attemptCount));
+    }
+
+    if (lastResult) {
+      return { result: lastResult, attemptCount };
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async waitForToolkitSlot(toolkit: ToolkitSlug): Promise<void> {
+    const lastExecutionAt = this.lastExecutionAt.get(toolkit);
+    if (typeof lastExecutionAt === "number") {
+      const elapsed = Date.now() - lastExecutionAt;
+      const waitMs = PER_TOOLKIT_COOLDOWN_MS - elapsed;
+      if (waitMs > 0) {
+        await Bun.sleep(waitMs);
+      }
+    }
+
+    this.lastExecutionAt.set(toolkit, Date.now());
   }
 
   private getAvailableScopes(toolkit: ToolkitSlug): string[] {
@@ -651,6 +751,14 @@ export class EndpointTesterAgent {
       this.eventDeleted = true;
     }
   }
+
+  private getDashboardOutputPath(reportOutputPath: string): string {
+    if (!reportOutputPath.includes("/")) {
+      return DEFAULT_DASHBOARD_OUTPUT;
+    }
+
+    return join(dirname(reportOutputPath), "dashboard.html");
+  }
 }
 
 function dedupeCandidates(candidates: ActionCandidate[]): ActionCandidate[] {
@@ -664,4 +772,38 @@ function dedupeCandidates(candidates: ActionCandidate[]): ActionCandidate[] {
   }
 
   return [...uniqueCandidates.values()].sort((left, right) => right.score - left.score);
+}
+
+function shouldRetryResult(result: Awaited<ReturnType<ComposioWithExecute["execute"]>>): boolean {
+  if (result.successful) {
+    return false;
+  }
+
+  return isTransientFailure(result.error);
+}
+
+function isTransientFailure(error: unknown): boolean {
+  const httpStatus = extractHttpStatus(error);
+  const message = summarizePayload(error).toLowerCase();
+
+  if (httpStatus === 408 || httpStatus === 425 || httpStatus === 429) {
+    return true;
+  }
+
+  if (typeof httpStatus === "number" && httpStatus >= 500 && httpStatus <= 599) {
+    return true;
+  }
+
+  return (
+    message.includes("rate limit") ||
+    message.includes("temporar") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("econnreset") ||
+    message.includes("service unavailable")
+  );
+}
+
+function getRetryDelayMs(attemptCount: number): number {
+  return 400 * 2 ** (attemptCount - 1);
 }
